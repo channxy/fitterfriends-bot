@@ -145,6 +145,29 @@ async def daily_penalty_check(context):
             except Exception as e:
                 logger.error("Failed to send penalty message to %s: %s", chat_id, e)
 
+    # ── Auto-end expired challenges ────────────────────────────────────────────
+    from datetime import date as _date
+    for ch in db.get_all_active_challenges():
+        if not ch["end_date"]:
+            continue
+        end = _date.fromisoformat(ch["end_date"])
+        if _date.today() > end:
+            chat_id = ch["chat_id"]
+            stats = db.get_challenge_member_stats(ch["id"], chat_id)
+            sorted_stats = sorted(stats, key=lambda x: x["debt"])
+            medals = ["🥇", "🥈", "🥉"]
+            lines = [f"🏁 *{ch['name']}* has ended!\n"]
+            for idx, s in enumerate(sorted_stats):
+                medal = medals[idx] if idx < 3 else "  "
+                debt_str = f"${s['debt']:.2f} owed" if s["debt"] > 0 else "all clear ✓"
+                lines.append(f"{medal} *{s['username']}* — {s['days_logged']} days logged — {debt_str}")
+            lines.append("\nStart the next one with /newchallenge 🚀")
+            db.end_challenge(ch["id"])
+            try:
+                await bot.send_message(chat_id, "\n".join(lines), parse_mode="Markdown")
+            except Exception as e:
+                logger.error("Failed to send challenge-end message to %s: %s", chat_id, e)
+
 
 async def daily_reminder(context):
     """Fires at 10pm leader's timezone. Reminds members who haven't hit today's goals."""

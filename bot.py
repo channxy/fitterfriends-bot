@@ -23,6 +23,11 @@ GOAL_LABELS = {"cal": "🍎 Calories", "run": "🏃 Running", "walk": "🚶 Walk
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def _sanitize(text: str, max_len: int = 100) -> str:
+    """Strip Markdown special chars and cap length."""
+    return text.replace("*", "").replace("_", "").replace("`", "").replace("[", "").replace("]", "")[:max_len]
+
+
 def _week_start(d: date, reset_day: int) -> date:
     return d - timedelta(days=(d.weekday() - reset_day) % 7)
 
@@ -48,27 +53,28 @@ async def _guard(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
     """Returns True if the request should be blocked."""
     chat = update.effective_chat
     user = update.effective_user
+    msg = update.effective_message
 
     if chat.type == "private":
-        await update.message.reply_text("Use me in a group chat.")
+        await msg.reply_text("Use me in a group chat.")
         return True
 
     try:
         cm = await ctx.bot.get_chat_member(chat.id, user.id)
         if cm.status in ("left", "kicked", "banned"):
-            await update.message.reply_text("You're not a member of this group.")
+            await msg.reply_text("You're not a member of this group.")
             return True
     except Exception:
         pass
 
     if need_group and not db.get_group(chat.id):
-        await update.message.reply_text("No group set up yet. Leader runs /setup.")
+        await msg.reply_text("No group set up yet. Leader runs /setup.")
         return True
 
     if need_member:
         targets = db.get_all_member_targets(user.id, chat.id)
         if not targets:
-            await update.message.reply_text("Set your personal goals first with /mygoals.")
+            await msg.reply_text("Set your personal goals first with /mygoals.")
             return True
 
     return False
@@ -126,6 +132,10 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "*Stats*\n"
         "/status — your progress today & this week\n"
         "/leaderboard — everyone at a glance\n\n"
+        "*Challenges*\n"
+        "`/newchallenge July Grind 2025-07-31` — start a new challenge (leader only)\n"
+        "/challenge — current challenge standings\n"
+        "/endchallenge — end challenge early (leader only)\n\n"
         "*Payments*\n"
         "/debt — who owes what\n"
         "`/paid` — mark full debt as paid\n"
@@ -168,8 +178,10 @@ async def setup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cb_goal_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     chat_id = query.message.chat_id
+    if not _is_leader(query, chat_id):
+        await query.answer("Only the group leader can do this.", show_alert=True)
+        return
     d = _get_setup(ctx, chat_id)
     selected: set = d.setdefault("selected_goals", set())
 
@@ -178,11 +190,13 @@ async def cb_goal_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not selected:
             await query.answer("Select at least one goal!", show_alert=True)
             return
+        await query.answer()
         d["goals_queue"] = sorted(selected, key=lambda g: ["cal","run","walk"].index(g))
         d["goals_done"] = []
         await _ask_daily_penalty(query, ctx, chat_id)
         return
 
+    await query.answer()
     if goal in selected:
         selected.discard(goal)
     else:
@@ -216,11 +230,15 @@ async def _ask_daily_penalty(query, ctx, chat_id):
 
 async def cb_setup_daily(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     chat_id = query.message.chat_id
-    # data: sdp_cal_5  sdp_run_10  etc.
+    if not _is_leader(query, chat_id):
+        await query.answer("Only the group leader can do this.", show_alert=True)
+        return
+    await query.answer()
     parts = query.data.split("_")  # ['sdp', 'cal', '5']
     goal, amount = parts[1], float(parts[2])
+    if goal not in ("cal", "run", "walk") or amount not in PENALTY_AMOUNTS:
+        return
     d = _get_setup(ctx, chat_id)
     d.setdefault("penalties", {})[goal] = {"daily": amount}
 
@@ -234,10 +252,15 @@ async def cb_setup_daily(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cb_setup_weekly(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     chat_id = query.message.chat_id
+    if not _is_leader(query, chat_id):
+        await query.answer("Only the group leader can do this.", show_alert=True)
+        return
+    await query.answer()
     parts = query.data.split("_")  # ['swp', 'cal', '10']
     goal, amount = parts[1], float(parts[2])
+    if goal not in ("cal", "run", "walk") or amount not in PENALTY_AMOUNTS:
+        return
     d = _get_setup(ctx, chat_id)
     d["penalties"][goal]["weekly"] = amount
     d["goals_done"].append(goal)
@@ -260,9 +283,14 @@ async def cb_setup_weekly(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cb_run_unit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     chat_id = query.message.chat_id
+    if not _is_leader(query, chat_id):
+        await query.answer("Only the group leader can do this.", show_alert=True)
+        return
+    await query.answer()
     unit = query.data.split("_")[2]  # km or min
+    if unit not in ("km", "min"):
+        return
     _get_setup(ctx, chat_id)["run_unit"] = unit
     await _next_goal_or_finalize(query, ctx, chat_id)
 
@@ -275,10 +303,18 @@ async def _next_goal_or_finalize(query, ctx, chat_id):
     await _finalize_setup(query, ctx, chat_id)
 
 
+def _is_leader(query, chat_id) -> bool:
+    group = db.get_group(chat_id)
+    return group and group["leader_id"] == query.from_user.id
+
+
 async def cb_reset_day(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     chat_id = query.message.chat_id
+    if not _is_leader(query, chat_id):
+        await query.answer("Only the group leader can do this.", show_alert=True)
+        return
+    await query.answer()
     day = int(query.data[4:])
     _get_setup(ctx, chat_id)["reset_day"] = day
 
@@ -684,7 +720,7 @@ async def cal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Please provide a valid calorie number.")
         return
 
-    label = " ".join(rest[1:]) or None
+    label = _sanitize(" ".join(rest[1:])) or None
     today = _user_today(user.id, chat.id)
     log_date = today + timedelta(days=offset)
     group = db.get_group(chat.id)
@@ -743,7 +779,7 @@ async def run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Please provide a valid number.")
         return
 
-    label = " ".join(rest[1:]) or None
+    label = _sanitize(" ".join(rest[1:])) or None
     unit = goal["run_unit"]
     today = _user_today(user.id, chat.id)
     log_date = today + timedelta(days=offset)
@@ -811,7 +847,7 @@ async def walk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Please provide a valid step count.")
         return
 
-    label = " ".join(rest[1:]) or None
+    label = _sanitize(" ".join(rest[1:])) or None
     today = _user_today(user.id, chat.id)
     log_date = today + timedelta(days=offset)
     group = db.get_group(chat.id)
@@ -1110,46 +1146,249 @@ async def leaderboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     goals = {g["goal_type"]: g for g in db.get_group_goals(chat.id)}
     members = db.get_all_members(chat.id)
     leader_tz = db.get_leader_timezone(chat.id) or "UTC"
-    lines = ["📊 *Leaderboard*\n"]
+    today_leader = datetime.now(pytz.timezone(leader_tz)).date()
+    week_start = _week_start(today_leader, group["reset_day"])
 
+    active = db.get_active_challenge(chat.id)
+    header = f"📊 *Leaderboard*"
+    if active:
+        header += f" — _{active['name']}_"
+    lines = [header, ""]
+
+    rows = []
     for m in members:
         uid = m["user_id"]
-        tz_str = m["timezone"] or leader_tz
-        today = datetime.now(pytz.timezone(tz_str)).date()
-        week_start = _week_start(today, group["reset_day"])
         debt = db.get_total_debt(uid, chat.id)
-        parts = [f"*{m['username']}*"]
+        goal_lines = []
 
         if "cal" in goals:
             t = db.get_member_target(uid, chat.id, "cal")
             if t and t["target"]:
                 lim = int(t["target"])
-                day_cal = db.get_cal_day_total(uid, chat.id, today)
-                icon = "⬜" if day_cal == 0 else ("✅" if day_cal <= lim else "⚠️")
-                parts.append(f"{icon} {day_cal}/{lim} cal")
+                day_cal = db.get_cal_day_total(uid, chat.id, today_leader)
+                if day_cal == 0:
+                    icon = "⬜"
+                elif day_cal <= lim:
+                    icon = "✅"
+                else:
+                    icon = "❌"
+                goal_lines.append(f"  {icon} Cals: {day_cal:,}/{lim:,}")
+            else:
+                goal_lines.append("  ➖ Cals: no target set")
+
         if "run" in goals:
             t = db.get_member_target(uid, chat.id, "run")
+            unit = goals["run"]["run_unit"]
             if t and t["target"]:
-                unit = goals["run"]["run_unit"]
                 if t["period"] == "freq":
                     qualifying = db.get_activity_qualifying_days(uid, chat.id, "run", week_start, t["target"])
                     days_needed = int(t["target2"])
                     icon = "✅" if qualifying >= days_needed else "⏳"
-                    parts.append(f"{icon} {qualifying}/{days_needed}days")
-                else:
-                    val = db.get_activity_day_total(uid, chat.id, "run", today) if t["period"] == "daily" else db.get_activity_week_total(uid, chat.id, "run", week_start)
+                    goal_lines.append(f"  {icon} Run: {qualifying}/{days_needed} days ≥{t['target']:.1f}{unit} (week)")
+                elif t["period"] == "weekly":
+                    val = db.get_activity_week_total(uid, chat.id, "run", week_start)
                     icon = "✅" if val >= t["target"] else "⏳"
-                    parts.append(f"{icon} {val:.1f}/{t['target']:.1f}{unit}")
+                    goal_lines.append(f"  {icon} Run: {val:.1f}/{t['target']:.1f}{unit} (week)")
+                else:
+                    val = db.get_activity_day_total(uid, chat.id, "run", today_leader)
+                    icon = "✅" if val >= t["target"] else "⏳"
+                    goal_lines.append(f"  {icon} Run: {val:.1f}/{t['target']:.1f}{unit} (today)")
+            else:
+                goal_lines.append("  ➖ Run: no target set")
+
         if "walk" in goals:
             t = db.get_member_target(uid, chat.id, "walk")
             if t and t["target"]:
-                val = db.get_activity_day_total(uid, chat.id, "walk", today) if t["period"] == "daily" else db.get_activity_week_total(uid, chat.id, "walk", week_start)
-                icon = "✅" if val >= t["target"] else "⏳"
-                parts.append(f"{icon} {int(val):,}/{int(t['target']):,}steps")
+                if t["period"] == "weekly":
+                    val = db.get_activity_week_total(uid, chat.id, "walk", week_start)
+                    icon = "✅" if val >= t["target"] else "⏳"
+                    goal_lines.append(f"  {icon} Steps: {int(val):,}/{int(t['target']):,} (week)")
+                else:
+                    val = db.get_activity_day_total(uid, chat.id, "walk", today_leader)
+                    icon = "✅" if val >= t["target"] else "⏳"
+                    goal_lines.append(f"  {icon} Steps: {int(val):,}/{int(t['target']):,} (today)")
+            else:
+                goal_lines.append("  ➖ Steps: no target set")
 
-        parts.append(f"💸${debt:.2f}")
-        lines.append("  ".join(parts))
+        if "weight" in goals or db.get_member_target(uid, chat.id, "weight"):
+            latest = db.get_latest_weight(uid, chat.id)
+            t = db.get_member_target(uid, chat.id, "weight")
+            if latest and t and t["target"]:
+                goal_wt = t["target"]
+                oldest = db.get_oldest_weight(uid, chat.id)
+                gaining = oldest is not None and goal_wt > oldest
+                if gaining:
+                    icon = "✅" if latest >= goal_wt else "⏳"
+                else:
+                    icon = "✅" if latest <= goal_wt else "⏳"
+                goal_lines.append(f"  {icon} Weight: {latest:.1f} kg → goal {goal_wt:.1f} kg")
+            elif latest:
+                goal_lines.append(f"  ⚖️ Weight: {latest:.1f} kg")
 
+        debt_str = f"💸 ${debt:.2f} owed" if debt > 0 else "✓ no debt"
+        rows.append((debt, m["username"], goal_lines, debt_str))
+
+    for _, name, goal_lines, debt_str in rows:
+        lines.append(f"*{name}*  {debt_str}")
+        lines.extend(goal_lines)
+        lines.append("")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+# ── /newchallenge · /challenge · /endchallenge ───────────────────────────────
+
+def _parse_challenge_date(s: str):
+    """Try to parse a date string in YYYY-MM-DD or DD Mon [YYYY] formats."""
+    from datetime import datetime as dt
+    for fmt in ("%Y-%m-%d", "%d %b %Y", "%d %B %Y", "%d %b", "%d %B"):
+        try:
+            d = dt.strptime(s, fmt)
+            if d.year == 1900:  # no year given — use current year
+                d = d.replace(year=date.today().year)
+            return d.date()
+        except ValueError:
+            pass
+    return None
+
+
+async def newchallenge(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    user = update.effective_user
+    if await _guard(update, ctx):
+        return
+    group = db.get_group(chat.id)
+    if group["leader_id"] != user.id:
+        await update.message.reply_text("Only the group leader can start a new challenge.")
+        return
+    if not ctx.args:
+        await update.message.reply_text(
+            "Usage: `/newchallenge <name> [end date]`\n"
+            "Examples:\n"
+            "`/newchallenge July Grind 2025-07-31`\n"
+            "`/newchallenge Summer Cut 31 Jul 2025`\n"
+            "`/newchallenge Ongoing` (no end date)",
+            parse_mode="Markdown"
+        )
+        return
+
+    args = list(ctx.args)
+    end_date = None
+    # Try to parse the last 1–3 args as a date
+    for n in (3, 2, 1):
+        if len(args) >= n + 1:
+            candidate = " ".join(args[-n:])
+            parsed = _parse_challenge_date(candidate)
+            if parsed:
+                if parsed <= date.today():
+                    await update.message.reply_text("End date must be in the future.")
+                    return
+                end_date = parsed
+                args = args[:-n]
+                break
+
+    name = _sanitize(" ".join(args).strip())
+    if not name:
+        await update.message.reply_text("Please give the challenge a name.")
+        return
+
+    # Post summary of ending challenge if one exists
+    existing = db.get_active_challenge(chat.id)
+    if existing:
+        stats = db.get_challenge_member_stats(existing["id"], chat.id)
+        lines = [f"🏁 *{existing['name']}* has ended!\n"]
+        sorted_stats = sorted(stats, key=lambda x: x["debt"])
+        medals = ["🥇", "🥈", "🥉"]
+        for idx, s in enumerate(sorted_stats):
+            medal = medals[idx] if idx < 3 else "  "
+            debt_str = f"${s['debt']:.2f} owed" if s["debt"] > 0 else "all clear ✓"
+            lines.append(f"{medal} *{s['username']}* — {s['days_logged']} days logged — {debt_str}")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        db.end_challenge(existing["id"])
+
+    today = _user_today(user.id, chat.id)
+    cid = db.create_challenge(chat.id, name, today, end_date)
+
+    end_str = f" · ends {end_date.strftime('%d %b %Y')}" if end_date else " · no end date"
+    await update.message.reply_text(
+        f"🚀 *{name}* has started! (Challenge #{cid}{end_str})\n\n"
+        f"All logs from now will be tagged to this challenge. Good luck! 💪",
+        parse_mode="Markdown"
+    )
+
+
+async def challenge(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if await _guard(update, ctx):
+        return
+    active = db.get_active_challenge(chat.id)
+    if not active:
+        history = db.get_challenge_history(chat.id)
+        if not history:
+            await update.message.reply_text(
+                "No challenge running yet. Leader can start one with `/newchallenge`.",
+                parse_mode="Markdown"
+            )
+        else:
+            lines = [f"No active challenge. Past challenges:\n"]
+            for c in history[:5]:
+                end = c["end_date"] or "open-ended"
+                lines.append(f"• *{c['name']}* (#{c['id']}) — {c['start_date']} → {end}")
+            lines.append("\nStart a new one with `/newchallenge`.")
+            await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        return
+
+    start = date.fromisoformat(active["start_date"])
+    days_in = (date.today() - start).days + 1
+    end_str = ""
+    if active["end_date"]:
+        end = date.fromisoformat(active["end_date"])
+        days_left = (end - date.today()).days
+        end_str = f"Ends: {end.strftime('%d %b %Y')} ({days_left} days left)\n"
+
+    stats = db.get_challenge_member_stats(active["id"], chat.id)
+    sorted_stats = sorted(stats, key=lambda x: x["debt"])
+    medals = ["🥇", "🥈", "🥉"]
+    lines = [
+        f"🏆 *{active['name']}* (Challenge #{active['id']})",
+        f"Started: {start.strftime('%d %b %Y')} · Day {days_in}",
+    ]
+    if end_str:
+        lines.append(end_str.strip())
+    lines.append("")
+    for idx, s in enumerate(sorted_stats):
+        medal = medals[idx] if idx < 3 else "  "
+        debt_str = f"${s['debt']:.2f} owed" if s["debt"] > 0 else "all clear ✓"
+        lines.append(f"{medal} *{s['username']}* — {s['days_logged']} days logged — {debt_str}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def endchallenge(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    user = update.effective_user
+    if await _guard(update, ctx):
+        return
+    group = db.get_group(chat.id)
+    if group["leader_id"] != user.id:
+        await update.message.reply_text("Only the group leader can end the challenge.")
+        return
+    active = db.get_active_challenge(chat.id)
+    if not active:
+        await update.message.reply_text("No active challenge to end.")
+        return
+
+    stats = db.get_challenge_member_stats(active["id"], chat.id)
+    sorted_stats = sorted(stats, key=lambda x: x["debt"])
+    medals = ["🥇", "🥈", "🥉"]
+    lines = [f"🏁 *{active['name']}* — Final Results\n"]
+    for idx, s in enumerate(sorted_stats):
+        medal = medals[idx] if idx < 3 else "  "
+        debt_str = f"${s['debt']:.2f} owed" if s["debt"] > 0 else "all clear ✓"
+        lines.append(f"{medal} *{s['username']}* — {s['days_logged']} days logged — {debt_str}")
+    lines.append("\nStart the next one with `/newchallenge`.")
+
+    db.end_challenge(active["id"])
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
@@ -1178,6 +1417,9 @@ async def paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     user = update.effective_user
     chat = update.effective_chat
+    if not _rate_ok(user.id, chat.id):
+        await update.message.reply_text("Slow down.")
+        return
     total_debt = db.get_total_debt(user.id, chat.id)
 
     amount = total_debt if not ctx.args else None
@@ -1238,9 +1480,12 @@ BOT_COMMANDS = [
     ("walk",        "Log steps e.g. /walk 8500"),
     ("weight",      "Log your weight e.g. /weight 65.5"),
     ("removelog",   "Remove a log e.g. /removelog cal"),
-    ("status",      "Your progress today & this week"),
-    ("leaderboard", "Everyone's stats at a glance"),
-    ("debt",        "See all outstanding debts"),
+    ("status",        "Your progress today & this week"),
+    ("leaderboard",   "Everyone's stats at a glance"),
+    ("newchallenge",  "Start a new challenge e.g. /newchallenge July Grind 2025-07-31"),
+    ("challenge",     "Current challenge standings"),
+    ("endchallenge",  "End the current challenge (leader only)"),
+    ("debt",          "See all outstanding debts"),
     ("paid",        "Record a payment e.g. /paid or /paid 10"),
     ("history",     "Your charges and payment history"),
     ("help",        "Show all commands"),
@@ -1259,7 +1504,7 @@ async def _post_init(app: Application):
 def main():
     import asyncio
     asyncio.set_event_loop(asyncio.new_event_loop())
-    token = os.environ["TELEGRAM_BOT_TOKEN"]
+    token = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ["BOT_TOKEN"]
     app = Application.builder().token(token).post_init(_post_init).build()
 
     # Commands
@@ -1271,6 +1516,7 @@ def main():
         ("cal", cal), ("run", run), ("walk", walk),
         ("weight", weight), ("removelog", removelog),
         ("status", status), ("leaderboard", leaderboard),
+        ("newchallenge", newchallenge), ("challenge", challenge), ("endchallenge", endchallenge),
         ("debt", debt), ("paid", paid), ("history", history),
     ]:
         app.add_handler(CommandHandler(cmd, fn))

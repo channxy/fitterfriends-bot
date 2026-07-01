@@ -1,0 +1,26 @@
+# fly.toml app configuration file generated for fitterfriends-bot on 2026-07-02T01:11:46+08:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'fitterfriends-bot'
+primary_region = 'sin'
+
+[build]
+
+[env]
+  PORT = '8080'
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = 'off'
+  auto_start_machines = false
+  min_machines_running = 1
+  processes = ['app']
+
+[[vm]]
+  memory = '1gb'
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 1024
